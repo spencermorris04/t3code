@@ -53,6 +53,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
+  ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
   ProviderUnsupportedError,
@@ -1065,6 +1066,108 @@ it.effect(
         const startPayload = codex.startSession.mock.calls[0]?.[0];
         assert.deepEqual(startPayload?.resumeCursor, initial.resumeCursor);
         assert.equal(startPayload?.cwd, cwd);
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "ProviderServiceLive releases the old instance before resuming through a replacement",
+  () =>
+    Effect.gen(function* () {
+      const primaryInstanceId = ProviderInstanceId.make("codex");
+      const overlayInstanceId = ProviderInstanceId.make("codex_b");
+      const primary = makeFakeCodexAdapter();
+      const overlay = makeFakeCodexAdapter();
+      const unsupported = () =>
+        new ProviderUnsupportedError({
+          provider: CODEX_DRIVER,
+        });
+      const replacementAdapter = {
+        ...overlay.adapter,
+        startSession: vi.fn((input: ProviderSessionStartInput) =>
+          Effect.gen(function* () {
+            if (yield* primary.hasSession(input.threadId)) {
+              return yield* new ProviderAdapterProcessError({
+                provider: CODEX_DRIVER,
+                threadId: input.threadId,
+                detail: `thread ${String(input.threadId)} already has an active writer`,
+              });
+            }
+            return yield* overlay.startSession(input);
+          }),
+        ),
+      } satisfies ProviderAdapterShape<ProviderAdapterError>;
+      const adapters = new Map<ProviderInstanceId, ProviderAdapterShape<ProviderAdapterError>>([
+        [primaryInstanceId, primary.adapter],
+        [overlayInstanceId, replacementAdapter],
+      ]);
+      const registry: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"] = {
+        getByInstance: (requestedInstanceId) => {
+          const adapter = adapters.get(requestedInstanceId);
+          return adapter ? Effect.succeed(adapter) : Effect.fail(unsupported());
+        },
+        getInstanceInfo: (requestedInstanceId) =>
+          adapters.has(requestedInstanceId)
+            ? Effect.succeed({
+                instanceId: requestedInstanceId,
+                driverKind: CODEX_DRIVER,
+                displayName: undefined,
+                enabled: true,
+                continuationIdentity: {
+                  driverKind: CODEX_DRIVER,
+                  continuationKey: "codex:home:/Users/example/.codex",
+                },
+              })
+            : Effect.fail(unsupported()),
+        listInstances: () => Effect.succeed(Array.from(adapters.keys())),
+        subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
+          PubSub.subscribe(pubsub),
+        ),
+      };
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(NodeServices.layer),
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer))),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(serverConfigTestLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      const threadId = asThreadId("thread-live-instance-switch");
+      const cwd = fixtureCwd("project-live-instance-switch");
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const initial = yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: primaryInstanceId,
+          threadId,
+          cwd,
+          runtimeMode: "full-access",
+        });
+
+        const resumed = yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: overlayInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        assert.equal(resumed.providerInstanceId, overlayInstanceId);
+        assert.deepEqual(
+          replacementAdapter.startSession.mock.calls[0]?.[0].resumeCursor,
+          initial.resumeCursor,
+        );
+        assert.equal(yield* primary.hasSession(threadId), false);
+        assert.equal(yield* overlay.hasSession(threadId), true);
       }).pipe(Effect.provide(providerLayer));
     }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -2853,7 +2956,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
-  it.effect("stops stale sessions in other providers after a successful replacement start", () =>
+  it.effect("stops stale sessions in other providers during replacement", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const threadId = asThreadId("thread-provider-replacement");
